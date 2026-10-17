@@ -130,3 +130,7 @@ Educational embedded-firmware and protocol-decoding prototype only. It is not ce
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+
+## Contribution and reporting
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the validation workflow. Record actual test logs and board measurements; do not present synthetic results as hardware measurements.
