@@ -1,99 +1,166 @@
 #include "sent_decoder.h"
+
 #include <string.h>
 
-static bool config_is_valid(const sent_decoder_config_t *c)
+static bool config_is_valid(const sent_decoder_config_t *config)
 {
     size_t i;
-    if (c == NULL || c->nominal_tick_counts == 0u ||
-        c->tolerance_percent > 50u || c->sync_min_counts == 0u ||
-        c->sync_min_counts >= c->sync_max_counts || c->crc_seed > 15u) return false;
-    for (i = 0u; i < 16u; ++i) if (c->crc_table[i] > 15u) return false;
+
+    if (config == NULL || config->nominal_tick_counts == 0u ||
+        config->tolerance_percent > 50u || config->sync_min_counts == 0u ||
+        config->sync_min_counts >= config->sync_max_counts ||
+        config->crc_seed > 0x0Fu) {
+        return false;
+    }
+
+    for (i = 0u; i < 16u; ++i) {
+        if (config->crc_table[i] > 0x0Fu) {
+            return false;
+        }
+    }
     return true;
 }
 
-sent_result_t sent_decoder_init(sent_decoder_t *d, const sent_decoder_config_t *c)
+sent_result_t sent_decoder_init(sent_decoder_t *decoder,
+                                const sent_decoder_config_t *config)
 {
-    if (d == NULL || !config_is_valid(c)) return SENT_RESULT_INVALID_ARGUMENT;
-    memset(d, 0, sizeof(*d));
-    d->config = *c;
-    d->diagnostics.signal_present = true;
+    if (decoder == NULL || !config_is_valid(config)) {
+        return SENT_RESULT_INVALID_ARGUMENT;
+    }
+
+    memset(decoder, 0, sizeof(*decoder));
+    decoder->config = *config;
+    decoder->diagnostics.signal_present = true;
     return SENT_RESULT_OK;
 }
 
-uint8_t sent_decoder_crc4(const sent_decoder_config_t *c, const uint8_t *n, size_t count)
+uint8_t sent_decoder_crc4(const sent_decoder_config_t *config,
+                          const uint8_t *nibbles,
+                          size_t nibble_count)
 {
     size_t i;
     uint8_t crc;
-    if (c == NULL || (n == NULL && count != 0u)) return 0u;
-    crc = (uint8_t)(c->crc_seed & 15u);
-    for (i = 0u; i < count; ++i) {
-        if (n[i] > 15u) return 0u;
-        crc = c->crc_table[(crc ^ n[i]) & 15u];
+
+    if (config == NULL || (nibbles == NULL && nibble_count != 0u)) {
+        return 0u;
     }
-    return (uint8_t)(crc & 15u);
+
+    crc = (uint8_t)(config->crc_seed & 0x0Fu);
+    for (i = 0u; i < nibble_count; ++i) {
+        if (nibbles[i] > 0x0Fu) {
+            return 0u;
+        }
+        crc = config->crc_table[(crc ^ nibbles[i]) & 0x0Fu];
+    }
+    return (uint8_t)(crc & 0x0Fu);
 }
 
-static bool to_nibble(const sent_decoder_config_t *c, uint16_t interval, uint8_t *out)
+static bool interval_to_nibble(const sent_decoder_config_t *config,
+                               uint16_t interval,
+                               uint8_t *nibble)
 {
-    uint32_t nominal = c->nominal_tick_counts;
-    uint32_t tolerance = (nominal * c->tolerance_percent) / 100u;
-    uint32_t units, residual, target;
-    if (out == NULL || interval < 12u * nominal || interval > 27u * nominal) return false;
+    const uint32_t nominal = config->nominal_tick_counts;
+    const uint32_t tolerance =
+        (nominal * (uint32_t)config->tolerance_percent) / 100u;
+    uint32_t units;
+    uint32_t residual;
+    uint32_t target;
+    uint32_t difference;
+
+    if (nibble == NULL || interval < 12u * nominal ||
+        interval > 27u * nominal) {
+        return false;
+    }
+
     units = interval / nominal;
     residual = interval % nominal;
-    if (residual * 2u >= nominal) ++units;
-    if (units < 12u || units > 27u) return false;
+    if (residual * 2u >= nominal) {
+        ++units;
+    }
+    if (units < 12u || units > 27u) {
+        return false;
+    }
+
     target = units * nominal;
-    if ((interval > target ? interval - target : target - interval) > tolerance) return false;
-    *out = (uint8_t)(units - 12u);
+    difference = (interval > target) ? (interval - target) : (target - interval);
+    if (difference > tolerance) {
+        return false;
+    }
+
+    *nibble = (uint8_t)(units - 12u);
     return true;
 }
 
-sent_result_t sent_decoder_process(sent_decoder_t *d, const uint16_t *capture,
-                                   size_t count, sent_frame_t *out)
+sent_result_t sent_decoder_process(sent_decoder_t *decoder,
+                                   const uint16_t *capture,
+                                   size_t capture_count,
+                                   sent_frame_t *out_frame)
 {
-    uint8_t n[5], crc;
-    size_t i, crc_count;
-    if (d == NULL || capture == NULL || out == NULL || count != 6u) {
-        if (d != NULL) d->diagnostics.last_frame_valid = false;
+    uint8_t nibbles[SENT_FRAME_NIBBLES];
+    uint8_t computed_crc;
+    size_t i;
+    size_t crc_count;
+
+    if (decoder == NULL || capture == NULL || out_frame == NULL ||
+        capture_count != (size_t)(1u + SENT_FRAME_NIBBLES)) {
+        if (decoder != NULL) {
+            decoder->diagnostics.last_frame_valid = false;
+        }
         return SENT_RESULT_INVALID_ARGUMENT;
     }
-    memset(out, 0, sizeof(*out));
-    if (capture[0] < d->config.sync_min_counts || capture[0] > d->config.sync_max_counts) {
-        ++d->diagnostics.sync_errors;
-        d->diagnostics.last_frame_valid = false;
+
+    memset(out_frame, 0, sizeof(*out_frame));
+    if (capture[0] < decoder->config.sync_min_counts ||
+        capture[0] > decoder->config.sync_max_counts) {
+        ++decoder->diagnostics.sync_errors;
+        decoder->diagnostics.last_frame_valid = false;
         return SENT_RESULT_SYNC_ERROR;
     }
-    for (i = 0u; i < 5u; ++i) {
-        if (!to_nibble(&d->config, capture[i + 1u], &n[i])) {
-            ++d->diagnostics.pulse_errors;
-            d->diagnostics.last_frame_valid = false;
+
+    for (i = 0u; i < SENT_FRAME_NIBBLES; ++i) {
+        if (!interval_to_nibble(&decoder->config, capture[i + 1u],
+                                &nibbles[i])) {
+            ++decoder->diagnostics.pulse_errors;
+            decoder->diagnostics.last_frame_valid = false;
             return SENT_RESULT_PULSE_ERROR;
         }
     }
-    out->status = n[0];
-    out->data[0] = n[1]; out->data[1] = n[2]; out->data[2] = n[3];
-    out->crc = n[4];
-    crc_count = d->config.crc_includes_status ? 4u : 3u;
-    crc = sent_decoder_crc4(&d->config,
-        d->config.crc_includes_status ? n : &n[1], crc_count);
-    out->crc_ok = crc == out->crc;
-    out->sequence = d->next_sequence++;
-    d->diagnostics.signal_present = true;
-    if (!out->crc_ok) {
-        ++d->diagnostics.crc_errors;
-        d->diagnostics.last_frame_valid = false;
+
+    out_frame->status = nibbles[0];
+    out_frame->data[0] = nibbles[1];
+    out_frame->data[1] = nibbles[2];
+    out_frame->data[2] = nibbles[3];
+    out_frame->crc = nibbles[4];
+
+    crc_count = decoder->config.crc_includes_status
+                    ? (size_t)(SENT_DATA_NIBBLES + 1u)
+                    : (size_t)SENT_DATA_NIBBLES;
+    computed_crc = sent_decoder_crc4(
+        &decoder->config,
+        decoder->config.crc_includes_status ? nibbles : &nibbles[1],
+        crc_count);
+    out_frame->crc_ok = (computed_crc == out_frame->crc);
+    out_frame->sequence = decoder->next_sequence++;
+    decoder->diagnostics.signal_present = true;
+
+    if (!out_frame->crc_ok) {
+        ++decoder->diagnostics.crc_errors;
+        decoder->diagnostics.last_frame_valid = false;
         return SENT_RESULT_CRC_ERROR;
     }
-    ++d->diagnostics.valid_frames;
-    d->diagnostics.last_frame_valid = true;
+
+    ++decoder->diagnostics.valid_frames;
+    decoder->diagnostics.last_frame_valid = true;
     return SENT_RESULT_OK;
 }
 
-void sent_decoder_note_timeout(sent_decoder_t *d)
+void sent_decoder_note_timeout(sent_decoder_t *decoder)
 {
-    if (d == NULL) return;
-    ++d->diagnostics.timeouts;
-    d->diagnostics.signal_present = false;
-    d->diagnostics.last_frame_valid = false;
+    if (decoder == NULL) {
+        return;
+    }
+
+    ++decoder->diagnostics.timeouts;
+    decoder->diagnostics.signal_present = false;
+    decoder->diagnostics.last_frame_valid = false;
 }
